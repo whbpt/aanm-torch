@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv*/
+*.pdb
+*.cif
+*.npz
+*.xtc
+.DS_Store

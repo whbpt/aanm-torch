@@ -1,0 +1,11 @@
+{
+  "name": "groel_sparse_test",
+  "dir": "/Users/cybertruck/Documents/AANM/experiments/groel",
+  "states": [
+    {"file": "state_closed.pdb", "name": "closed7"},
+    {"file": "state_bullet.pdb", "name": "bullet14"}
+  ],
+  "aanm": {"n_steps": 3, "f": 0.3, "n_modes": 10, "network": "assembly", "solver": "auto"},
+  "dwell": 1, "morph": 2, "loop": false, "batch": false,
+  "out": "groel_mini_trajectory.pdb"
+}
