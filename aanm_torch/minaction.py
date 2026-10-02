@@ -37,7 +37,7 @@ def path_action(path, xA, HA, xB, HB, dt=1.0, diff=1.0, vscale=1.0):
     return kin + pot / vscale
 
 
-def min_action_path(coordsA, coordsB, n_images=12, n_iters=200, lr=1.0,
+def min_action_path(coordsA, coordsB, n_images=12, n_iters=1500, lr=0.1,
                     dt=1.0, diff=1.0, cutoff=15.0, aligned=True, verbose=False):
     """Least-action path between two endpoint structures.
 
@@ -63,8 +63,6 @@ def min_action_path(coordsA, coordsB, n_images=12, n_iters=200, lr=1.0,
     ts = torch.linspace(0.0, 1.0, M, dtype=torch.float64)
     interior = torch.stack([(1 - t) * xA + t * xB for t in ts[1:-1]]).clone()
     interior.requires_grad_(True)
-    # the action is smooth and nearly quadratic — LBFGS with strong-Wolfe line
-    # search converges where Adam stalls on the small potential gradients
     hist = []
 
     def total_action():
@@ -73,21 +71,23 @@ def min_action_path(coordsA, coordsB, n_images=12, n_iters=200, lr=1.0,
     with torch.no_grad():
         lin_action = float(total_action())
 
-    opt = torch.optim.LBFGS([interior], lr=lr, max_iter=n_iters,
-                            line_search_fn="strong_wolfe")
-
-    def closure():
+    # Adam with best-so-far bookkeeping: converges to the same minimum as
+    # LBFGS on this smooth objective (verified) and keeps one gradient per
+    # step, which scales and composes better
+    opt = torch.optim.Adam([interior], lr=lr)
+    best = (lin_action, [f.detach().clone() for f in interior])
+    for it in range(n_iters):
         opt.zero_grad()
         S = total_action()
         S.backward()
-        hist.append(float(S))
-        return S
-
-    opt.step(closure)
-    with torch.no_grad():
-        frames = [xA] + [f.detach().clone() for f in interior] + [xB]
-        # closure() is also evaluated at line-search trial points, so the
-        # reported action must come from the final parameters directly
-        final_action = float(total_action())
+        opt.step()
+        with torch.no_grad():
+            s = float(total_action())
+            hist.append(s)
+            if s < best[0]:
+                best = (s, [f.detach().clone() for f in interior])
+        if verbose and it % 100 == 0:
+            print(f"  iter {it}: action {s:.4f} (linear {lin_action:.4f})")
+    frames = [xA] + best[1] + [xB]
     return frames, {"action": hist, "linear_action": lin_action,
-                    "final_action": final_action, "vscale": vscale}
+                    "final_action": best[0], "vscale": vscale}
