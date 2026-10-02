@@ -15,17 +15,50 @@ P/O5′/C5′/C4′/C3′/O3′,cutoff 默认按节点间距自动建议(蛋白 
 ```
 aanm_torch/
   __init__.py    # 设备选择(cuda > mps > cpu;MPS 无 float64 时自动回落 CPU)
-  pdbio.py       # PDB 解析(主链或全原子)/多模型写出(与原脚本相同的定宽格式)
+  pdbio.py       # PDB 解析(主链或全原子,蛋白+核酸)/多模型写出
   geom.py        # Kabsch(单个+批量)、旋转插值、RMSD(torch)
-  anm.py         # ANM:稠密 Hessian、成对键列表、三种模式求解器(eigh/lobpcg/eigsh)、断链检测
-  adaptive.py    # Adaptive ANM:oneway / alternating / 多转换批量(共享同一步进核)
-  clash.py       # 精确逐对 clash 计数(chunked cdist;支持按残基组跳过共价近邻)
-  backbone.py    # CA 路径 -> 全原子重建(同链相邻 CA 局部 Kabsch、端点中点混合、侧链)
+  anm.py         # ANM:稠密 Hessian、成对键列表、稀疏优先求解器、断链检测
+  adaptive.py    # Adaptive ANM:oneway / alternating / 多转换批量(共享步进核)
+  clash.py       # 精确逐对 clash 计数(支持按残基组跳过共价近邻)
+  backbone.py    # CA/P 节点路径 -> 全原子重建(同链邻居、中点混合、侧链)
+  saxs.py        # 可微 Debye 散射曲线(O(N^2) 成对核,GPU/批量)
+  minaction.py   # 最小作用量路径:两端弹性势上的 Onsager-Machlup 作用量, LBFGS
+  pathway.py     # ANMPathway 风格双向路径 + 逐步软化弛豫(纯软模式形变)
+  clustenm.py    # ClustENM 风格系综:软模式热激发采样 + clash 过滤 + k-means
+  cryofit.py     # NMFF 风格 cryo-EM 柔性拟合:极简 MRC 读写 + 可微高斯密度
+                 # + 实空间相关系数,ANM 模式系数 autograd 优化
 scripts/
-  aanm_path.py            # 两状态间 AANM 路径 + 指标(对应原 aanm_path.py)
-  make_aanm_trajectory.py # 多状态循环轨迹生成(对应原 make_aanm_trajectory.py)
-tests/                    # unittest 合成数据全套 + ProDy 对比(见下)
+  aanm_path.py            # 两状态间 AANM 路径 + 指标
+  make_aanm_trajectory.py # 多状态循环轨迹生成
+  saxs_curve.py           # PDB -> SAXS 曲线(.dat)
+  cryofit.py              # PDB + MRC -> 柔性拟合结构
+tests/                    # 59 个 unittest 用例 + ProDy 对比
 ```
+
+### 经典工具的 torch 重写(设计取舍,诚实说明)
+
+`saxs` / `minaction` / `pathway` / `clustenm` / `cryofit` 是五个经典工具的
+torch 化,共同点是**全程可微 + GPU/批量**;相对原版的简化都经过测试验证并
+在此声明:
+
+- **saxs**:常数形状因子(电子数)而非 q 依赖的 Cromer-Mann + 溶剂排除——
+  适合相对曲线与可微拟合,不适合绝对强度对标实验。两原子解析解、naive
+  循环逐点一致、有限差分梯度一致。
+- **minaction**:Onsager-Machlup 离散作用量 + 两端 ANM 势,势能项按端点
+  能量归一(作用量绝对单位任意,只做路径间相对比较);与 Franklin et al.
+  2007 服务器的常数约定不同。LBFGS 优化,作用量显著低于线性插值。
+- **pathway**:ANMPathway.o 的双向自适应步进保留;其"切换势垒上的过渡态
+  搜索"简化为**逐步软化弛豫**——每帧相对前一帧的位移严格投影到当前网络
+  最软模式子空间(可精确检验,测试断言刚性能量占比 < 1e-8);汇入固定端点
+  的收尾步豁免(锚点不可重投影)。
+- **clustenm**:原版的力场能量极小化弛豫替换为"只激发软模式(不引入局部
+  应变)+ clash 过滤";采样振幅以 Å 为尺度无关参数。无偏 ClustENM 做的是
+  种子附近的平衡涨落,不做远距离盆地间过渡(那需要 adaptive/pathway 引导)。
+- **cryofit**:极简 MRC(仅 mode-2 float32);模式系数以 RMSD-Å 为单位。
+  已验证其工作区(软模式主导的构象变化可精确恢复,CCC→1.0、RMSD→0);
+  也验证了其边界——目标形变不在软模式子空间时(合成体系投影仅 ~0.4),
+  CCC 仍可通过非真实形变上升,**不能把模式基表达不了的变化拟合回去**,这是
+  NMFF 方法的固有限制,使用时须自证形变的软模式覆盖度。
 
 ## 用法
 
