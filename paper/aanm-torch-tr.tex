@@ -1,0 +1,352 @@
+\documentclass[11pt]{article}
+
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{adjustbox}
+\usepackage{enumitem}
+\usepackage[UTF8]{ctex}
+\usepackage[
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=darkgray,
+    urlcolor=blue,
+    bookmarks=true,
+    bookmarksnumbered=true,
+    unicode=true
+]{hyperref}
+
+\geometry{a4paper, top=2.5cm, bottom=2.5cm, left=2.5cm, right=2.5cm}
+
+\setlength{\parskip}{0.35em}
+
+\begin{document}
+
+% ---- 手工标题块(封面单独渲染,不使用 \maketitle)----
+\begin{center}
+{\LARGE\bfseries aanm-torch:面向构象动力学的可微弹性网络工具包}\\[0.8em]
+{\large 技术报告(v1.2)}\\[0.5em]
+{Haobo Wang (whbpt)}\\[0.3em]
+{2026 年 11 月 \quad \url{https://github.com/whbpt/aanm-torch}}
+\end{center}
+
+\vspace{0.5em}
+\noindent\textbf{摘要}\quad
+aanm-torch 是 ProDy 生态中自适应各向异性网络模型(AANM)形变工具链的 PyTorch
+重写,目标有三:数值不降级的忠实移植、把可计算体系规模从约 2500 个残基推进到
+两万个残基、以及全程可微以衔接深度学习工作流。本文报告其实现选择、与参考实现
+ProDy 2.4.1 的逐位数值对照(Hessian 差异 $2.5\times10^{-14}$、逐步 RMSD 差异
+$6.3\times10^{-13}$)、稀疏优先求解器的实测扩展性(两万残基单步约 2 分钟),
+以及五个经典工具(SAXS Debye 散射、MinActionPath 最小作用量路径、ANMPathway
+式双向路径、ClustENM 系综采样、NMFF 式 cryo-EM 柔性拟合)的可微重写及其取舍
+与验证。另附一项试点研究:将 ANM 软模式投影作为引导势注入 BioEmu 扩散采样,
+在腺苷酸激酶上实现约 3~\AA 的系综定向牵引,并给出其当前质量局限的诚实评估。
+全部结论由仓库内 59 个单元测试与基准脚本支撑。
+
+\vspace{0.6em}
+
+\section{引言与动机}
+
+弹性网络模型(ANM/GNM)\cite{atilgan2001}把蛋白主链简化为距离截断的弹簧
+网络,其 Hessian 矩阵的低频特征向量即集体运动模式。ProDy\cite{bakan2011,bakan2014}
+是该领域事实上的参考实现,其 \texttt{calcAdaptiveANM}\cite{yang2009} 在两个
+构象态之间沿软模式迭代步进,是构象转换路径生成的常用引擎。本项目的起点是一套
+基于 ProDy 的分子机器动画管线,在实践中暴露三个工程瓶颈:
+
+\begin{enumerate}[itemsep=1pt,topsep=2pt]
+\item \textbf{规模上限}。稠密特征分解为 $O((3N)^3)$ 时间、$O((3N)^2)$ 内存,
+2500 个残基已在分钟级,更大的组装体不可行;
+\item \textbf{不可微、不可批}。逐条转换串行求解,无法利用 GPU 批量对角化,
+也无法把弹性势嵌入梯度学习;
+\item \textbf{静默缺陷}。主链重建在特定输入下写出空帧、clash 计数系统性漏检、
+邻居选取跨链借用原子等(第~\ref{sec:ext} 节)。
+\end{enumerate}
+
+aanm-torch 以纯 PyTorch 重写整条管线(解析除外),所有张量运算可运行于
+CUDA/MPS/CPU,并保持与参考实现的数值一致性。定位是\textbf{技术报告}:方法学
+本身属于既有工作,本文的贡献在于忠实移植的验证方法、规模化的工程路径、以及
+可微化带来的新用法。
+
+\section{核心:忠实移植与数值保真}
+\label{sec:core}
+
+\subsection{ANM 与自适应步进}
+
+$N$ 个节点(氨基酸取 C$\alpha$、核苷酸取 P)在截断距离 $r_c$ 内以弹簧连接,
+$3N\times 3N$ Hessian 的块形式为
+\begin{equation}
+\mathbf{H}_{ij} = -\frac{\gamma}{r_{ij}^2}\,
+\hat{\mathbf{r}}_{ij}\hat{\mathbf{r}}_{ij}^{\!\top},
+\qquad
+\mathbf{H}_{ii} = -\sum_{j\neq i}\mathbf{H}_{ij},
+\label{eq:hess}
+\end{equation}
+其中 $\hat{\mathbf{r}}_{ij}$ 为单位方向向量、$\gamma$ 为弹簧常数。自适应
+AANM\cite{yang2009} 每步在当前结构处建网、取最软的若干非刚体模式,把指向目标的
+形变向量 $\mathbf{d}$ 投影到模式子空间得到组合步进方向 $\mathbf{v}$,并以
+\begin{equation}
+s = f\,\frac{\mathbf{v}^{\!\top}\mathbf{d}}{\mathbf{v}^{\!\top}\mathbf{v}},
+\qquad \mathbf{x} \leftarrow \mathbf{x} + s\,\mathbf{v}
+\label{eq:step}
+\end{equation}
+更新坐标,配以动态 Fmin 选模、模式数倍增与三条收敛判据(RMSD 停滞、达标、断链)。
+aanm-torch 将整个步进核(\texttt{\_step\_core})统一供单向、交替(alternating)
+与多转换批量三种驱动共享,保证不同执行路径应用完全一致的更新。
+
+\subsection{与 ProDy 2.4.1 的数值对照}
+
+表~\ref{tab:parity} 汇总 SERCA(E1.2Ca$\to$E1.ATP,994 个公共 C$\alpha$)上的
+对照,参考值由设计者 venv 内的 ProDy 2.4.1 子进程产生,浮点环境一致(float64/CPU)。
+该对照作为单元测试长期保留于仓库。
+
+\begin{table}[htbp]
+\centering
+\caption{与 ProDy 2.4.1 的数值对照(SERCA,994 C$\alpha$)}
+\label{tab:parity}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+量 & 最大差异 \\
+\midrule
+ANM Hessian(逐元素) & $2.5\times10^{-14}$ \\
+逐步 RMSD(10 步) & $6.3\times10^{-13}$ \\
+路径帧坐标 & $4.4\times10^{-12}$~\AA \\
+完整轨迹 PDB(v1.0 语义,16 帧) & 1e-3~\AA 输出精度下逐位一致 \\
+合成体系(含停滞用例) & $1.8\times10^{-15}$(ProDy 同步停滞) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+值得记录的一点:合成测试中发现单向 AANM 在螺旋径向扩张类形变上停滞,与
+ProDy 的逐步 RMSD 完全一致至 $10^{-15}$——停滞是算法固有行为(最软模式为
+弯曲而非扩张),交替模式才是此类体系的正确工具。这促使我们把 alternating
+作为一等公民实现。
+
+\section{求解器与规模}
+\label{sec:solver}
+
+ANM 网络天然稀疏(15~\AA 截断下每节点数十条边),瓶颈仅在特征分解。aanm-torch
+的调度策略为\textbf{稀疏优先}:
+
+\begin{itemize}[itemsep=1pt,topsep=2pt]
+\item $\leq 250$ 个 C$\alpha$:稠密 \texttt{eigh}(小体系更快,且保住数值基线);
+\item 以上:scipy 稀疏 \texttt{eigsh}(负 shift),Hessian 由键列表稀疏组装,
+内存 $O(\text{边数})$,从不物化稠密矩阵;
+\item 无健康 scipy 时回退 GPU \texttt{lobpcg}。
+\end{itemize}
+
+多状态轨迹生成的各转换 Hessian 可堆成批量、一次 GPU 对角化(锁步推进,
+测试保证与串行逐位一致)。
+
+\begin{table}[htbp]
+\centering
+\caption{稀疏求解实测(Mac CPU,2 线程;每次模式求解 10 个非刚体模式)}
+\label{tab:bench}
+\begin{tabular}{rrl}
+\toprule
+体系规模(残基) & 每次求解 & 说明 \\
+\midrule
+2\,000 & 2.2~s & 稠密 eigh 需 14.4~s(6.4$\times$) \\
+5\,000 & 12~s & 稠密路线在此之上不可行 \\
+10\,000 & 34~s & 3 万自由度 \\
+20\,000 & $\approx$2~min & 6 万自由度,内存 $O(\text{边数})$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+交叉点约在 700 个 C$\alpha$。真实数据端到端:GroEL 十四聚体(1OEL$\to$1AON,
+公共七链组成 3668 节点的整体网络,另七条链作为帽结构滑入)整条轨迹 15~秒。
+诚实的边界:eigsh 走 CPU,GPU 加速的是多状态批量 eigh,两者互补;十万残基级
+(病毒衣壳)需要 RTB 块降维,尚未实现。
+
+\section{能力扩展与缺陷修复}
+\label{sec:ext}
+
+相对原始脚本的改进(全部有测试支撑):
+
+\begin{enumerate}[itemsep=1.5pt,topsep=2pt]
+\item \textbf{整体网络(assembly)}。同源寡聚体不再由锚链刚体复制,全部链的
+节点并入同一弹性网络,链间相对运动直接来自低频模式;
+\item \textbf{交替步进}。两端交替向中间形变(ProDy AANM\_ALTERNATING 的移植),
+对单向停滞体系是解药;
+\item \textbf{重建三处修正}。邻居限制同链内(原版按全局排序取邻居,跨链借
+C$\alpha$ 定向)、A/B 端点源在路径中点线性混合(消除硬切换跳变)、侧链可
+刚体跟随残基局部系;
+\item \textbf{clash 计数修正}。原网格版只比较同一 1~\AA 格内原子、系统性漏检
+跨格近邻,且误计肽键;现为精确逐对统计加残基组共价排除;
+\item \textbf{蛋白/DNA/RNA 与混合体系}。每残基自动选节点(氨基酸 C$\alpha$、
+核苷酸 P),一次解析进同一网络,截断距离按节点间距自动建议(蛋白
+$\approx$15~\AA、RNA $\approx$24~\AA;tRNA 1EHZ 实测通过);
+\item \textbf{工程}。空帧默认报错(原版曾静默写出 24 个空 MODEL)、重建预处理
+$O(N^2)\to O(N)$、断链检测分块、全部 AANM 参数可配置、59 个单元测试
+(原为零)。
+\end{enumerate}
+
+\section{五个经典工具的可微重写}
+\label{sec:classic}
+
+共同设计原则:核心运算(成对距离、特征分解、投影)全部为 torch 张量操作,
+因此\textbf{端到端可微}——这是相对原版 Fortran/NumPy 实现的本质增量,代价是
+各处刻意简化。逐项说明如下。
+
+\subsection{SAXS Debye 散射}
+
+$I(q)=\sum_{ij}f_if_j\,\mathrm{sinc}(qr_{ij})$\cite{debye1915},成对距离批量
+计算、对 $q$ 分块。验证:两原子解析解、$30\times30$ naive 双循环逐点一致
+($10^{-8}$)、autograd 梯度与有限差分一致。\textbf{取舍}:常数电子数形状因子
+而非 q 依赖的 Cromer--Mann 加溶剂排除——适合相对曲线与可微拟合,不适合绝对
+强度对标实验。
+
+\subsection{MinActionPath 最小作用量路径}
+
+两端 ANM 势上的 Onsager--Machlup 作用量
+\begin{equation}
+S=\sum_k\Big[\frac{\lVert x_{k+1}-x_k\rVert^2}{4D\,\Delta t}
++\frac{\Delta t}{2}\big(V(x_k)+V(x_{k+1})\big)\Big],
+\label{eq:action}
+\end{equation}
+中间像以 Adam 优化(系数以 RMSD-\AA 为单位,best-so-far 记账)。受
+MinActionPath\cite{franklin2007} 启发;\textbf{取舍}:势能项按端点能量归一,
+作用量绝对单位任意、只作路径间相对比较,常数约定与原服务器不同。验证:测试
+体系上优化路径作用量为线性插值的 0.844(Adam 与 LBFGS 收敛到同一极小值,曾
+误判 Adam 失败,实为动能主导区间改进空间太小)。
+
+\subsection{ANMPathway 式双向路径}
+
+双向自适应步进加\textbf{逐步软化弛豫}:每帧相对前一帧的位移严格投影到当前
+网络最软模式子空间。验证:内部步的刚性能量占比 $<10^{-8}$(可精确检验的物理
+判据)。\textbf{取舍}:原版 web 服务器(2015 年上线的两态路径服务 ANMPathway.o)
+的过渡态搜索被简化为软化判据;汇入固定端点的收尾步豁免(锚点不可重投影)。
+
+\subsection{ClustENM 系综采样}
+
+围绕代表构象做软模式热激发采样(振幅以 \AA\ 为尺度无关参数,内部按软模式平均
+特征值换算温度)、clash 过滤、k-means 聚类、代表构象迭代重建网络,遵循
+ClustENM\cite{kurkcuoglu2016} 的循环结构。\textbf{取舍}:原版的力场能量极小化
+弛豫替换为只激发软模式(不引入局部应变)加 clash 过滤。诚实边界:无偏
+ClustENM 做种子附近的平衡涨落,\textbf{不做}远距离盆地间过渡(需 adaptive/
+pathway 引导)。
+
+\subsection{NMFF 式 cryo-EM 柔性拟合}
+
+极简 MRC 读写(仅 mode-2 float32)、可微高斯密度前向模型、实空间相关系数,
+ANM 模式系数由 autograd 优化,遵循 NMFF\cite{tama2004} 与 DireX
+\cite{schroder2007} 的模式坐标思想。\textbf{验证与边界(重要)}:软模式主导的
+目标形变可精确恢复(CCC$\to$1.0000、RMSD$\to10^{-5}$~\AA);而目标形变不在
+软模式子空间时(合成体系投影仅 $\approx0.4$),CCC 仍可通过非真实形变上升
+——模式基表达不了的变化拟合不回去,这是 NMFF 方法的固有边界。使用前应先
+验证期望形变的软模式覆盖度。
+
+\section{试点研究:ANM 软模式引导的 BioEmu 扩散采样}
+\label{sec:bioemu}
+
+BioEmu\cite{lewis2025} 是序列条件下的蛋白平衡系综扩散模型。我们测试了一个
+自然的组合:去噪每步后,把目标构象 B 相对当前结构 x 的形变向量投影到 x 的
+ANM 软模式子空间,作为引导位移注入(即式~\ref{eq:step} 的方向、固定小步长),
+使扩散过程沿物理上软的集体方向趋向 B。
+
+\textbf{协议}:SDEdit 自端点 A 前向加噪至 $t_0$(两字段均用模型自身前向链,
+预存锚定链),高噪声段以 RePaint 式锚定把前向加噪的 A 按 0.7 比例注回、防止
+链熔融;$t<0.35$ 后引导接管。对照臂为同种子同初始化、仅关闭引导。
+
+\begin{table}[htbp]
+\centering
+\caption{ADK(4AKE$\to$1AKE,214 残基,$t_0=0.6$,seed 0,各 4 样本;
+两参考相距 7.1~\AA,Rg 为 19.5/16.4~\AA)}
+\label{tab:bioemu}
+\begin{tabular}{lccc}
+\toprule
+臂 & rmsd$\to$1AKE & rmsd$\to$4AKE & Rg~(\AA) \\
+\midrule
+无引导、无锚定 & 13.5 & 12.3 & 18.6 \\
+仅引导 & 12.2 & 12.7 & 17.3 \\
+仅锚定 & 10.0 & \textbf{7.7} & \textbf{19.3} \\
+引导 + 锚定 & \textbf{7.9} & 9.2 & 17.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+两个机制独立有效且可叠加(13.5$\to$7.9~\AA):锚定使链真正落在 A 的正确盆地
+(距 4AKE 7.7~\AA、Rg 复原到晶体值),引导再把系综推到闭态附近。\textbf{诚实
+的局限}:clash 基线校准显示晶体 4AKE 为 0 处、BioEmu 原生采样 1 处、我们的
+样本 $\approx$150 处($<$4~\AA C$\alpha$)——盆地级控制达成,残基级几何仍未
+干净,根因是锚定期取向约定与模型内部约定存在出入。达到物理级帧的正规路径是
+BioEmu $\geq$1.3 的 steering 框架(自定义势 + 粒子重采样无偏修正;我们已按
+1.4.1 源码接口写好软模式 CV 与配置,待 Linux/CUDA 机器)或逐帧能量弛豫。
+
+\section{可复现性}
+
+仓库(\url{https://github.com/whbpt/aanm-torch})含 59 个单元测试:几何
+(Kabsch/旋转插照)、Hessian 手算值与对称性、三求解器互检、clash 语义、重建
+连续性、批量-串行一致、蛋白与核酸端到端轨迹,以及 ProDy 对照(子进程运行
+设计者 venv 的 ProDy 2.4.1,逐步 RMSD 差 $\leq10^{-9}$)。运行环境仅需
+\texttt{torch>=2.0} 与 \texttt{numpy},稀疏求解加 \texttt{scipy}。基准脚本
+\texttt{experiments/04\_bench\_sparse.py} 复现表~\ref{tab:bench}。
+
+\begin{thebibliography}{9}\small
+
+\bibitem{atilgan2001}
+Atilgan AR, Durell SR, Jernigan RL, Demirel MC, Keskin O, Bahar I.
+Anisotropy of fluctuation dynamics of proteins with an elastic-network model.
+\emph{Biophysical Journal}, 2001, 80: 505--515.
+
+\bibitem{bakan2011}
+Bakan A, Meireles LM, Bahar I.
+ProDy: protein dynamics inferred from theory and experiments.
+\emph{Bioinformatics}, 2011, 27(11): 1575--1577.
+
+\bibitem{bakan2014}
+Bakan A, Dutta A, Maiorov V, Bahar I.
+Evol and ProDy for bridging protein sequence structure and dynamics.
+\emph{Bioinformatics}, 2014, 30(18): 2681--2683.
+
+\bibitem{yang2009}
+Yang Z, M\'ajek P, Bahar I.
+Allosteric transitions of supramolecular systems explored by network models:
+application to chaperonin GroEL.
+\emph{Biophysical Journal}, 2009, 96(11): 4438--4446.
+
+\bibitem{kabsch1976}
+Kabsch W.
+A solution for the best rotation to relate two sets of vectors.
+\emph{Acta Crystallographica A}, 1976, 32: 922--923.
+
+\bibitem{franklin2007}
+Franklin J, Koehl P, Doniach S, Delarue M.
+MinActionPath: maximum probability path for kinetic modeling of biomolecular
+structural changes.
+\emph{Journal of Chemical Physics}, 2007, 127: 175101.
+
+\bibitem{kurkcuoglu2016}
+Kuruko\u{g}lu Z, Doruker M.
+ClustENM: ENM-based sampling of conformational space coupled with clustering.
+\emph{Proteins}, 2016, 84: 596--607.
+
+\bibitem{tama2004}
+Tama F, Miyashita O, Brooks CL III.
+Flexible multi-scale fitting of atomic structures into low-resolution electron
+density maps with elastic network normal mode analysis.
+\emph{Journal of Molecular Biology}, 2004, 337(4): 985--999.
+
+\bibitem{schroder2007}
+Schr\"oder GF, Brunger AT, Levitt M.
+Combining efficient conformational sampling with a deformable elastic network
+to facilitate the simultaneous fitting of low-resolution X-ray and cryo-EM
+data. \emph{Structure}, 2007, 15(8): 915--925.
+
+\bibitem{debye1915}
+Debye P.
+Zerstreuung von R\"ontgenstrahlen.
+\emph{Annalen der Physik}, 1915, 351: 809--823.
+
+\bibitem{lewis2025}
+Lewis M, Wu T, et al.
+Learning to emulate protein equilibrium ensemble dynamics with diffusion
+models. \emph{Science Advances}, 2025. doi:10.1126/science.adv9817
+(preprint: bioRxiv 2024.12.05.626885).
+
+\end{thebibliography}
+
+\end{document}

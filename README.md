@@ -1,5 +1,8 @@
 # aanm-torch
 
+> 技术报告:[paper/aanm-torch-tr.pdf](paper/aanm-torch-tr.pdf)(方法、数值对照、
+> 规模基准、五个经典工具重写的取舍、BioEmu 引导试点;LaTeX 源在同目录)。
+
 AANM(Adaptive ANM)构象形变路径与分子机器 morph 轨迹工具 ——
 `designer/machine/scripts/` 下 ProDy 版本的 PyTorch 重写,计算全部跑在 torch 张量上,
 有 CUDA 的机器自动用 GPU(`--device cuda`),Mac 上可用 MPS,否则 CPU。
